@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"flag"
+	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/push"
 	"log"
 	"math/big"
 	"time"
@@ -16,8 +19,9 @@ func main() {
 	// Command-line arguments
 	rpc := flag.String("rpc", "", "RPC URL for the blockchain")
 	dsn := flag.String("dsn", "", "Database DSN")
-	interval := flag.Int("interval", 5, "Polling interval in seconds")
+	interval := flag.Int("interval", 3, "Polling interval in seconds")
 	startHeight := flag.Int64("start", -1, "Starting block height")
+	pushGateway := flag.String("pushgateway", "", "Pushgateway address")
 	flag.Parse()
 
 	if *rpc == "" || *dsn == "" {
@@ -58,6 +62,12 @@ func main() {
 	ticker := time.NewTicker(time.Duration(*interval) * time.Second)
 	defer ticker.Stop()
 
+
+	rowCountMetric := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "quai_network_block_difficulty",
+		Help: fmt.Sprintf("quai_network_block_difficulty"),
+	})
+
 	for range ticker.C {
 		// Get the current block number
 		currentBlockNumber, err := client.BlockNumber(ctx)
@@ -87,6 +97,23 @@ func main() {
 					continue
 				}
 				log.Printf("Inserted data for block %d: difficulty=%d", blockNumber, difficulty)
+
+				// Update the metric
+				rowCountMetric.Set(float64(difficulty))
+
+				// Push the metric to Pushgateway
+				err = push.New(*pushGateway, "quai").
+					Collector(rowCountMetric).
+					Grouping("job", "quai").
+					Push()
+				if err != nil {
+					log.Printf("Failed to push metrics: %v", err)
+				} else {
+					log.Printf("Pushed metrics successfully: %s = %d", "quai_network_block_difficulty", difficulty)
+				}
+
+
+
 			}
 			lastHeight = currentHeight
 		}
