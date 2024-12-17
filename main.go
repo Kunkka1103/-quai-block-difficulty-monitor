@@ -2,120 +2,126 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/push"
 	"log"
 	"math/big"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/dominant-strategies/go-quai/quaiclient/ethclient"
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/push"
 )
 
+// connectRPC 尝试连接到 RPC，并实现重试机制
+func connectRPC(rpcURL string) (*ethclient.Client, error) {
+	var client *ethclient.Client
+	var err error
+	for i := 0; i < 5; i++ { // 最多重试 5 次
+		client, err = ethclient.Dial(rpcURL)
+		if err == nil {
+			log.Println("成功连接到 RPC")
+			return client, nil
+		}
+		log.Printf("连接 RPC 失败（尝试 %d 次）：%v", i+1, err)
+		time.Sleep(5 * time.Second)
+	}
+	return nil, fmt.Errorf("多次尝试后无法连接 RPC：%v", err)
+}
+
 func main() {
-	// Command-line arguments
-	rpc := flag.String("rpc", "", "RPC URL for the blockchain")
-	dsn := flag.String("dsn", "", "Database DSN")
-	interval := flag.Int("interval", 3, "Polling interval in seconds")
-	startHeight := flag.Int64("start", -1, "Starting block height")
-	pushGateway := flag.String("pushgateway", "", "Pushgateway address")
+	// 命令行参数
+	rpc := flag.String("rpc", "", "区块链的 RPC URL")
+	interval := flag.Int("interval", 3, "轮询间隔（秒）")
+	pushGateway := flag.String("pushgateway", "", "Pushgateway 地址")
 	flag.Parse()
 
-	if *rpc == "" || *dsn == "" {
-		log.Fatalf("rpc and dsn parameters are required")
+	// 检查必需的参数
+	if *rpc == "" || *pushGateway == "" {
+		log.Fatalf("rpc 和 pushgateway 参数是必需的")
 	}
 
-	// Connect to the blockchain RPC
-	client, err := ethclient.Dial(*rpc)
+	// 连接到区块链 RPC
+	client, err := connectRPC(*rpc)
 	if err != nil {
-		log.Fatalf("failed to connect to node: %v", err)
+		log.Fatalf("连接 RPC 失败：%v", err)
 	}
+	// 使用 defer 正确关闭客户端，假设 Close() 无返回值
 	defer client.Close()
 
-	// Connect to the database
-	db, err := sql.Open("mysql", *dsn)
-	if err != nil {
-		log.Fatalf("failed to connect to database: %v", err)
-	}
-	defer db.Close()
+	// 设置 Prometheus 指标
+	difficultyGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "quai_network_current_block_difficulty",
+		Help: "当前区块的难度",
+	})
+	prometheus.MustRegister(difficultyGauge)
 
-	ctx := context.Background()
-
-	// Determine the starting block height
-	var lastHeight *big.Int
-	if *startHeight >= 0 {
-		lastHeight = big.NewInt(*startHeight)
-	} else {
-		blockNumber, err := client.BlockNumber(ctx)
-		if err != nil {
-			log.Fatalf("failed to get block number: %v", err)
-		}
-		lastHeight = big.NewInt(int64(blockNumber))
-	}
-
-	log.Printf("Starting from block height: %s", lastHeight)
-
-	// Polling loop
+	// 设置定时器
 	ticker := time.NewTicker(time.Duration(*interval) * time.Second)
 	defer ticker.Stop()
 
+	// 设置信号处理以实现优雅关闭
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	rowCountMetric := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "quai_network_block_difficulty",
-		Help: fmt.Sprintf("quai_network_block_difficulty"),
-	})
+	// 主循环
+	for {
+		select {
+		case <-ticker.C:
+			// 创建带有超时的上下文
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
-	for range ticker.C {
-		// Get the current block number
-		currentBlockNumber, err := client.BlockNumber(ctx)
-		if err != nil {
-			log.Printf("failed to get block number: %v", err)
-			continue
-		}
-
-		currentHeight := big.NewInt(int64(currentBlockNumber))
-		if currentHeight.Cmp(lastHeight) > 0 {
-			// Query all heights between lastHeight and currentHeight
-			for height := new(big.Int).Add(lastHeight, big.NewInt(1)); height.Cmp(currentHeight) <= 0; height.Add(height, big.NewInt(1)) {
-				header, err := client.HeaderByNumber(ctx, height)
-				if err != nil {
-					log.Printf("failed to get block header for height %s: %v", height, err)
-					continue
-				}
-
-				// Insert block difficulty and block number into the database
-				difficulty := header.WorkObjectHeader().Difficulty().Uint64()
-				blockNumber := header.WorkObjectHeader().Number().Uint64()
-
-				_, err = db.Exec(`INSERT INTO quai_block_difficulty (block_number, difficulty, timestamp) VALUES (?, ?, ?)`,
-					blockNumber, difficulty, time.Now().UTC())
-				if err != nil {
-					log.Printf("failed to insert data for block %d: %v", blockNumber, err)
-					continue
-				}
-				log.Printf("Inserted data for block %d: difficulty=%d", blockNumber, difficulty)
-
-				// Update the metric
-				rowCountMetric.Set(float64(difficulty))
-
-				// Push the metric to Pushgateway
-				err = push.New(*pushGateway, "quai").
-					Collector(rowCountMetric).
-					Grouping("job", "quai").
-					Push()
-				if err != nil {
-					log.Printf("Failed to push metrics: %v", err)
-				} else {
-					log.Printf("Pushed metrics successfully: %s = %d", "quai_network_block_difficulty", difficulty)
-				}
-
-
-
+			// 获取当前区块号
+			currentBlockNumber, err := client.BlockNumber(ctx)
+			if err != nil {
+				log.Printf("获取当前区块号失败：%v", err)
+				cancel() // 显式取消上下文
+				continue
 			}
-			lastHeight = currentHeight
+
+			// 将 currentBlockNumber 转换为 *big.Int
+			blockNumberBig := new(big.Int).SetUint64(currentBlockNumber)
+
+			// 获取区块头
+			header, err := client.HeaderByNumber(ctx, blockNumberBig)
+			if err != nil {
+				log.Printf("获取区块 %d 的区块头失败：%v", currentBlockNumber, err)
+				cancel() // 显式取消上下文
+				continue
+			}
+
+			// 获取难度
+			difficultyBig := header.Difficulty()
+			if difficultyBig == nil {
+				log.Printf("区块 %d 的难度信息为空", currentBlockNumber)
+				cancel()
+				continue
+			}
+			difficulty := difficultyBig.Uint64()
+
+			// 更新指标
+			difficultyGauge.Set(float64(difficulty))
+
+			// 推送指标到 Pushgateway
+			err = push.New(*pushGateway, "quai_current_difficulty").
+				Collector(difficultyGauge).
+				Grouping("job", "quai").
+				Push()
+			if err != nil {
+				log.Printf("推送指标失败：%v", err)
+			} else {
+				log.Printf("成功推送当前区块 %d 的难度：%d", currentBlockNumber, difficulty)
+			}
+
+			// 取消上下文以释放资源
+			cancel()
+
+		case <-quit:
+			log.Println("收到关闭信号，正在退出...")
+			return
 		}
 	}
 }
